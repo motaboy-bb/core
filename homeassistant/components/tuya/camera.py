@@ -16,13 +16,12 @@ from homeassistant.components.camera import (
     CameraEntityDescription,
     CameraEntityFeature,
 )
-from homeassistant.components.camera.const import CAMERA_STREAM_SOURCE_TIMEOUT  # pylint: disable=home-assistant-component-root-import
 from homeassistant.components.stream import Stream
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import TUYA_DISCOVERY_NEW, DeviceCategory
+from .const import STREAM_SOURCE_TIMEOUT, TUYA_DISCOVERY_NEW, DeviceCategory
 from .coordinator import TuyaConfigEntry
 from .entity import TuyaEntity, TuyaEntityDescription
 
@@ -114,16 +113,10 @@ class TuyaCameraEntity(TuyaEntity, CameraEntity):
             if (stream := self.stream) is None:
                 return await super().async_create_stream()
 
-            # A new allocation is needed only after this source was attempted
-            # and either failed or became idle. The worker may report
-            # available=True between retries, so availability alone cannot
-            # establish that playback has recovered.
-            if not stream.source_failed and (
-                stream.outputs() or not stream.source_attempted
-            ):
+            if stream.outputs() and stream.available:
                 return stream
 
-            async with asyncio.timeout(CAMERA_STREAM_SOURCE_TIMEOUT):
+            async with asyncio.timeout(STREAM_SOURCE_TIMEOUT):
                 source = await self.stream_source()
             if not source:
                 return None

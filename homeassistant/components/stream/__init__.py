@@ -323,17 +323,11 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 class _WorkerControl:
     """Thread-safe lifecycle control for a single stream worker thread."""
 
-    def __init__(
-        self, source: str, *, attempted: bool = False, failed: bool = False
-    ) -> None:
-        """Initialize worker control with an atomic source snapshot."""
+    def __init__(self) -> None:
+        """Initialize worker control."""
         self._lock = threading.Lock()
         self._stopped = False
         self._restart = False
-        self._source = source
-        self._source_revision = 0
-        self._attempted_revision = 0 if attempted else -1
-        self._failed_revision = 0 if failed else -1
         self.interrupt = threading.Event()
 
     @property
@@ -347,48 +341,22 @@ class _WorkerControl:
             self._stopped = True
             self.interrupt.set()
 
-    def request_restart(self, source: str) -> None:
-        """Publish a source atomically, even if the old worker is stopping."""
-        with self._lock:
-            self._source = source
-            self._source_revision += 1
-            if not self._stopped:
-                self._restart = True
-                self.interrupt.set()
-
-    def begin_attempt(self) -> tuple[str, int] | None:
-        """Take a source snapshot and acknowledge its restart atomically."""
+    def request_restart(self) -> None:
+        """Interrupt the current read or retry backoff to reload the source."""
         with self._lock:
             if self._stopped:
-                return None
+                return
+            self._restart = True
+            self.interrupt.set()
+
+    def consume_restart(self) -> bool:
+        """Consume a pending restart if not stopped."""
+        with self._lock:
+            if self._stopped or not self._restart:
+                return False
             self._restart = False
             self.interrupt.clear()
-            self._attempted_revision = self._source_revision
-            return self._source, self._source_revision
-
-    @property
-    def restart_pending(self) -> bool:
-        """Return whether a newer source was published during the attempt."""
-        with self._lock:
-            return self._restart and not self._stopped
-
-    def mark_failed(self, revision: int) -> None:
-        """Latch failure only for the source that was actually attempted."""
-        with self._lock:
-            if revision == self._source_revision and not self._stopped:
-                self._failed_revision = revision
-
-    @property
-    def source_attempted(self) -> bool:
-        """Return whether this source was passed to a worker."""
-        with self._lock:
-            return self._attempted_revision == self._source_revision
-
-    @property
-    def source_failed(self) -> bool:
-        """Keep failure visible during retries until the source changes."""
-        with self._lock:
-            return self._failed_revision == self._source_revision
+            return True
 
 
 class Stream:
@@ -414,8 +382,6 @@ class Stream:
         self._start_stop_lock = asyncio.Lock()
         self._thread: threading.Thread | None = None
         self._worker_control: _WorkerControl | None = None
-        self._source_attempted = False
-        self._source_failed = False
         self._outputs: dict[str, StreamOutput] = {}
         self._keyframe_converter = KeyFrameConverter(
             hass, stream_settings, dynamic_stream_settings
@@ -490,20 +456,6 @@ class Stream:
         """Return False if the stream is started and known to be unavailable."""
         return self._available
 
-    @property
-    def source_attempted(self) -> bool:
-        """Return whether the current source has been used by a worker."""
-        if (control := self._worker_control) is not None:
-            return control.source_attempted
-        return self._source_attempted
-
-    @property
-    def source_failed(self) -> bool:
-        """Return whether the current source failed, including during retries."""
-        if (control := self._worker_control) is not None:
-            return control.source_failed
-        return self._source_failed
-
     def set_update_callback(self, update_callback: Callable[[], None]) -> None:
         """Set callback to run when state changes."""
         self._update_callback = update_callback
@@ -529,11 +481,7 @@ class Stream:
                 # The thread must have crashed/exited. Join to clean up the
                 # previous thread.
                 self._thread.join(timeout=0)
-            control = _WorkerControl(
-                self.source,
-                attempted=self.source_attempted,
-                failed=self.source_failed,
-            )
+            control = _WorkerControl()
             self._worker_control = control
             self._thread = threading.Thread(
                 name="stream_worker",
@@ -552,10 +500,8 @@ class Stream:
             "Updating stream source %s", redact_credentials(str(new_source))
         )
         self.source = new_source
-        self._source_attempted = False
-        self._source_failed = False
         if self._worker_control is not None:
-            self._worker_control.request_restart(new_source)
+            self._worker_control.request_restart()
 
     def _set_state(self, available: bool) -> None:
         """Set the stream state by updating the callback."""
@@ -578,10 +524,11 @@ class Stream:
         wait_timeout = 0
         while True:
             if wait_timeout and control.interrupt.wait(timeout=wait_timeout):
+                if not control.consume_restart():
+                    break
                 wait_timeout = 0
-            if (attempt := control.begin_attempt()) is None:
+            elif control.is_stopped:
                 break
-            source, revision = attempt
 
             start_time = time.time()
             self._set_state(True)
@@ -594,7 +541,7 @@ class Stream:
             self._diagnostics.increment("start_worker")
             try:
                 stream_worker(
-                    source,
+                    self.source,
                     self.pyav_options,
                     self._stream_settings,
                     stream_state,
@@ -606,11 +553,9 @@ class Stream:
                 self._logger.error("Error from stream worker: %s", str(err))
 
             stream_state.discontinuity()
-            if control.restart_pending:
+            if control.consume_restart():
                 wait_timeout = 0
                 continue
-            if not control.is_stopped:
-                control.mark_failed(revision)
             if not _should_retry() or control.is_stopped:
                 break
 
@@ -631,13 +576,7 @@ class Stream:
             )
 
         async def worker_finished() -> None:
-            # A replacement source may have arrived after this worker exited;
-            # do not remove providers belonging to the next attempt.
-            if (
-                control.is_stopped
-                or control.restart_pending
-                or self._worker_control is not control
-            ):
+            if control.is_stopped:
                 return
             # The worker is no longer checking availability
             # of the stream and can no longer track it so
@@ -670,8 +609,6 @@ class Stream:
                 return
             self._worker_control.stop()
             await self.hass.async_add_executor_job(self._thread.join)
-            self._source_attempted = self._worker_control.source_attempted
-            self._source_failed = self._worker_control.source_failed
             self._thread = None
             self._worker_control = None
             if not self.available:
