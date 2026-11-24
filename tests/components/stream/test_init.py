@@ -10,10 +10,12 @@ from unittest.mock import MagicMock, Mock, patch
 import av
 import pytest
 
+from homeassistant.components import stream as stream_module
 from homeassistant.components.stream import (
     SOURCE_TIMEOUT,
     StreamClientError,
     StreamOpenClientError,
+    StreamWorkerError,
     __name__ as stream_name,
     async_check_stream_client_error,
     create_stream,
@@ -361,6 +363,238 @@ async def test_update_source_during_retry_backoff(
         finally:
             worker_wake.set()
             await stream.stop()
+
+
+async def test_stream_source_failure_latched_through_retry(
+    hass: HomeAssistant, should_retry: Mock
+) -> None:
+    """Keep failed-source status through the retry's transient available=True."""
+    await async_setup_component(hass, DOMAIN, {"stream": {}})
+    should_retry.return_value = True
+    retry_started = threading.Event()
+    new_source_started = threading.Event()
+    attempts: list[str] = []
+    source = STREAM_SOURCE
+    fresh_source = f"{STREAM_SOURCE}-fresh"
+
+    def stream_worker(stream_source: str, *args: Any) -> None:
+        attempts.append(stream_source)
+        if stream_source == source and attempts.count(source) == 1:
+            raise StreamWorkerError("Simulated expired stream")
+        if stream_source == source:
+            retry_started.set()
+        else:
+            new_source_started.set()
+        args[-1].wait(TIMEOUT)
+
+    stream = create_stream(hass, source, {}, dynamic_stream_settings())
+    provider = stream.add_provider(HLS_PROVIDER)
+    stream.access_token = "test-token"
+
+    with (
+        patch(
+            "homeassistant.components.stream.worker.stream_worker",
+            side_effect=stream_worker,
+        ),
+        patch("homeassistant.components.stream.STREAM_RESTART_INCREMENT", 0.01),
+    ):
+        try:
+            await stream.start()
+            assert await hass.async_add_executor_job(retry_started.wait, TIMEOUT)
+            await hass.async_block_till_done()
+
+            assert stream.available
+            assert stream.source_attempted
+            assert stream.source_failed
+
+            stream.update_source(fresh_source)
+            assert not stream.source_attempted
+            assert not stream.source_failed
+            assert await hass.async_add_executor_job(new_source_started.wait, TIMEOUT)
+
+            assert stream.source_attempted
+            assert not stream.source_failed
+            assert stream.outputs()[HLS_PROVIDER] is provider
+            assert stream.access_token == "test-token"
+            assert attempts == [source, source, fresh_source]
+        finally:
+            await asyncio.wait_for(stream.stop(), timeout=TIMEOUT)
+
+
+async def test_source_update_atomic_with_worker_attempt(
+    hass: HomeAssistant, should_retry: Mock
+) -> None:
+    """Never open a newly allocated source twice across a worker handoff."""
+    await async_setup_component(hass, DOMAIN, {"stream": {}})
+    should_retry.return_value = True
+
+    original_begin = stream_module._WorkerControl.begin_attempt  # pylint: disable=protected-access
+    initial_selected = threading.Event()
+    release_selection = threading.Event()
+    fresh_opened = threading.Event()
+    attempts: list[str] = []
+    new_source = f"{STREAM_SOURCE}-new"
+
+    def pause_after_selection(control: Any) -> tuple[str, int] | None:
+        chosen = original_begin(control)
+        if chosen is not None and chosen[0] == STREAM_SOURCE:
+            initial_selected.set()
+            assert release_selection.wait(TIMEOUT)
+        return chosen
+
+    def stream_worker(source: str, *args: Any) -> None:
+        attempts.append(source)
+        if source == new_source:
+            fresh_opened.set()
+        args[-1].wait(TIMEOUT)
+
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
+    stream.add_provider(HLS_PROVIDER)
+
+    with (
+        patch(
+            "homeassistant.components.stream._WorkerControl.begin_attempt",
+            new=pause_after_selection,
+        ),
+        patch(
+            "homeassistant.components.stream.worker.stream_worker",
+            side_effect=stream_worker,
+        ),
+    ):
+        try:
+            await stream.start()
+            assert await hass.async_add_executor_job(initial_selected.wait, TIMEOUT)
+            assert stream.source_attempted
+            stream.update_source(new_source)
+            # A new URL is not considered consumed until its atomic selection.
+            assert not stream.source_attempted
+            release_selection.set()
+            assert await hass.async_add_executor_job(fresh_opened.wait, TIMEOUT)
+            assert stream.source_attempted
+            assert not stream.source_failed
+            assert attempts == [STREAM_SOURCE, new_source]
+        finally:
+            release_selection.set()
+            await asyncio.wait_for(stream.stop(), timeout=TIMEOUT)
+
+    assert attempts == [STREAM_SOURCE, new_source]
+
+
+async def test_source_update_during_stop_preserves_new_source_state(
+    hass: HomeAssistant, should_retry: Mock
+) -> None:
+    """A new source arriving while stop joins must stay unattempted."""
+    await async_setup_component(hass, DOMAIN, {"stream": {}})
+    should_retry.return_value = False
+    old_worker_started = threading.Event()
+    release_old_worker = threading.Event()
+    fresh_worker_started = threading.Event()
+    new_source = f"{STREAM_SOURCE}-fresh"
+    opened_sources: list[str] = []
+
+    def stream_worker(source: str, *args: Any) -> None:
+        opened_sources.append(source)
+        if source == STREAM_SOURCE:
+            old_worker_started.set()
+            assert release_old_worker.wait(TIMEOUT)
+        else:
+            fresh_worker_started.set()
+            args[-1].wait(TIMEOUT)
+
+    stream = create_stream(hass, STREAM_SOURCE, {}, dynamic_stream_settings())
+    stream.add_provider(HLS_PROVIDER)
+    with patch(
+        "homeassistant.components.stream.worker.stream_worker",
+        side_effect=stream_worker,
+    ):
+        try:
+            await stream.start()
+            assert await hass.async_add_executor_job(old_worker_started.wait, TIMEOUT)
+            stop_task = hass.async_create_task(stream.stop())
+            # Ensure the old control is marked stopped but its thread has not
+            # joined before the URL is updated.
+            for _ in range(100):
+                if stream._worker_control.is_stopped:
+                    break
+                await asyncio.sleep(0)
+            assert stream._worker_control.is_stopped
+            stream.update_source(new_source)
+            release_old_worker.set()
+            await asyncio.wait_for(stop_task, TIMEOUT)
+
+            assert stream.source == new_source
+            assert not stream.source_attempted
+            assert not stream.source_failed
+            stream.add_provider(HLS_PROVIDER)
+            await stream.start()
+            assert await hass.async_add_executor_job(fresh_worker_started.wait, TIMEOUT)
+            assert opened_sources == [STREAM_SOURCE, new_source]
+        finally:
+            release_old_worker.set()
+            await asyncio.wait_for(stream.stop(), TIMEOUT)
+
+
+async def test_stale_worker_completion_does_not_remove_refreshed_provider(
+    hass: HomeAssistant, should_retry: Mock
+) -> None:
+    """Deferred cleanup must not delete HLS output after source replacement."""
+    await async_setup_component(hass, DOMAIN, {"stream": {}})
+    should_retry.return_value = False
+    old_worker_started = threading.Event()
+    new_worker_started = threading.Event()
+    completion_scheduled = asyncio.Event()
+    pending_completions: list[Any] = []
+    source = STREAM_SOURCE
+    new_source = f"{STREAM_SOURCE}-next"
+
+    def stream_worker(current: str, *args: Any) -> None:
+        if current == source:
+            old_worker_started.set()
+            return
+        new_worker_started.set()
+        args[-1].wait(TIMEOUT)
+
+    original_create_task = hass.create_task
+
+    def intercept_worker_cleanup(coro: Any, *args: Any, **kwargs: Any) -> Any:
+        if (
+            "worker_finished" in getattr(coro, "__qualname__", "")
+            and not pending_completions
+        ):
+            pending_completions.append(coro)
+            hass.loop.call_soon_threadsafe(completion_scheduled.set)
+            return MagicMock()
+        return original_create_task(coro, *args, **kwargs)
+
+    stream = create_stream(hass, source, {}, dynamic_stream_settings())
+    provider = stream.add_provider(HLS_PROVIDER)
+    stream.access_token = "test-token"
+
+    with (
+        patch(
+            "homeassistant.components.stream.worker.stream_worker",
+            side_effect=stream_worker,
+        ),
+        patch.object(hass, "create_task", side_effect=intercept_worker_cleanup),
+    ):
+        try:
+            await stream.start()
+            assert await hass.async_add_executor_job(old_worker_started.wait, TIMEOUT)
+            await asyncio.wait_for(completion_scheduled.wait(), TIMEOUT)
+            assert pending_completions
+
+            stream.update_source(new_source)
+            # Simulate the old worker's callback running after the refresh.
+            for coro in pending_completions:
+                await coro
+            assert stream.outputs()[HLS_PROVIDER] is provider
+            assert stream.access_token == "test-token"
+
+            await stream.start()
+            assert await hass.async_add_executor_job(new_worker_started.wait, TIMEOUT)
+            assert stream.outputs()[HLS_PROVIDER] is provider
+        finally:
+            await asyncio.wait_for(stream.stop(), TIMEOUT)
 
 
 async def test_output_added_while_stopping_is_kept(

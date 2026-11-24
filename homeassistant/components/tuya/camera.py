@@ -114,7 +114,13 @@ class TuyaCameraEntity(TuyaEntity, CameraEntity):
             if (stream := self.stream) is None:
                 return await super().async_create_stream()
 
-            if stream.outputs() and stream.available:
+            # A new allocation is needed only after this source was attempted
+            # and either failed or became idle. The worker may report
+            # available=True between retries, so availability alone cannot
+            # establish that playback has recovered.
+            if not stream.source_failed and (
+                stream.outputs() or not stream.source_attempted
+            ):
                 return stream
 
             async with asyncio.timeout(CAMERA_STREAM_SOURCE_TIMEOUT):
