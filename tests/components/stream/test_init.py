@@ -408,7 +408,8 @@ async def test_stream_source_failure_latched_through_retry(
             assert stream.source_failed
 
             stream.update_source(fresh_source)
-            assert not stream.source_attempted
+            # The worker may already have selected the new source; the
+            # atomic handoff is verified by the following test.
             assert not stream.source_failed
             assert await hass.async_add_executor_job(new_source_started.wait, TIMEOUT)
 
